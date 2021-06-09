@@ -287,18 +287,52 @@ End:
 	return rc;
 }
 
+static int IsUTF8Encode(const char *src)
+{
+    int i;
+    const UCHAR *Byte = (const UCHAR *)src;
+
+    for (i = 0; i < MAX_PATH && Byte[i]; i++)
+    {
+        if (Byte[i] > 127)
+        {
+            return 1;
+        }
+    }
+    
+    return 0;
+}
+
+static int Utf8ToUtf16(const char* src, WCHAR * dst)
+{
+    int size = MultiByteToWideChar(CP_UTF8, 0, src, -1, dst, 0);
+    return MultiByteToWideChar(CP_UTF8, 0, src, -1, dst, size + 1);
+}
+
 static BOOL IsPathExist(BOOL Dir, const char *Fmt, ...)
 {
 	va_list Arg;
 	HANDLE hFile;
 	DWORD Attr;
-	CHAR FilePath[MAX_PATH];
+    int UTF8 = 0;
+	CHAR FilePathA[MAX_PATH];
+	WCHAR FilePathW[MAX_PATH];
 
 	va_start(Arg, Fmt);
-	vsnprintf_s(FilePath, sizeof(FilePath), sizeof(FilePath), Fmt, Arg);
+	vsnprintf_s(FilePathA, sizeof(FilePathA), sizeof(FilePathA), Fmt, Arg);
 	va_end(Arg);
 
-	hFile = CreateFileA(FilePath, FILE_READ_EA, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
+    UTF8 = IsUTF8Encode(FilePathA);
+
+    if (UTF8)
+    {
+        Utf8ToUtf16(FilePathA, FilePathW);
+        hFile = CreateFileW(FilePathW, FILE_READ_EA, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
+    }
+    else
+    {
+        hFile = CreateFileA(FilePathA, FILE_READ_EA, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
+    }
 	if (INVALID_HANDLE_VALUE == hFile)
 	{
 		return FALSE;
@@ -306,8 +340,15 @@ static BOOL IsPathExist(BOOL Dir, const char *Fmt, ...)
 
 	CloseHandle(hFile);
 
-	Attr = GetFileAttributesA(FilePath);
-
+    if (UTF8)
+    {
+        Attr = GetFileAttributesW(FilePathW);
+    }
+    else
+    {
+        Attr = GetFileAttributesA(FilePathA);
+    }
+	
 	if (Dir)
 	{
 		if ((Attr & FILE_ATTRIBUTE_DIRECTORY) == 0)
@@ -395,7 +436,14 @@ int VentoyMountISOByAPI(const char *IsoPath)
 
 	Log("VentoyMountISOByAPI <%s>", IsoPath);
 
-	MultiByteToWideChar(CP_ACP, 0, IsoPath, (int)strlen(IsoPath), wFilePath, (int)(sizeof(wFilePath) / sizeof(WCHAR)));
+    if (IsUTF8Encode(IsoPath))
+    {
+        MultiByteToWideChar(CP_UTF8, 0, IsoPath, (int)strlen(IsoPath), wFilePath, (int)(sizeof(wFilePath) / sizeof(WCHAR)));
+    }
+    else
+    {
+        MultiByteToWideChar(CP_ACP, 0, IsoPath, (int)strlen(IsoPath), wFilePath, (int)(sizeof(wFilePath) / sizeof(WCHAR)));
+    }
 
 	memset(&StorageType, 0, sizeof(StorageType));
 	memset(&OpenParameters, 0, sizeof(OpenParameters));
@@ -513,6 +561,55 @@ static CHAR GetMountLogicalDrive(void)
 	return Letter;
 }
 
+UINT64 GetVentoyEfiPartStartSector(HANDLE hDrive)
+{
+	BOOL bRet;
+	DWORD dwSize; 
+	MBR_HEAD MBR;	
+	VTOY_GPT_INFO *pGpt = NULL;
+	UINT64 StartSector = 0;
+
+	SetFilePointer(hDrive, 0, NULL, FILE_BEGIN);
+
+	bRet = ReadFile(hDrive, &MBR, sizeof(MBR), &dwSize, NULL);
+	Log("Read MBR Ret:%u Size:%u code:%u", bRet, dwSize, LASTERR);
+
+	if ((!bRet) || (dwSize != sizeof(MBR)))
+	{
+		0;
+	}
+
+	if (MBR.PartTbl[0].FsFlag == 0xEE)
+	{
+		Log("GPT partition style");
+
+		pGpt = malloc(sizeof(VTOY_GPT_INFO));
+		if (!pGpt)
+		{
+			return 0;
+		}
+
+		SetFilePointer(hDrive, 0, NULL, FILE_BEGIN);
+		bRet = ReadFile(hDrive, pGpt, sizeof(VTOY_GPT_INFO), &dwSize, NULL);		
+		if ((!bRet) || (dwSize != sizeof(VTOY_GPT_INFO)))
+		{
+			Log("Failed to read gpt info %d %u %d", bRet, dwSize, LASTERR);
+			return 0;
+		}
+
+		StartSector = pGpt->PartTbl[1].StartLBA;
+		free(pGpt);
+	}
+	else
+	{
+		Log("MBR partition style");
+		StartSector = MBR.PartTbl[1].StartSectorId;
+	}
+
+	Log("GetVentoyEfiPart StartSector: %llu", StartSector);
+	return StartSector;
+}
+
 int VentoyMountISOByImdisk(const char *IsoPath, DWORD PhyDrive)
 {
 	int rc = 1;
@@ -521,6 +618,7 @@ int VentoyMountISOByImdisk(const char *IsoPath, DWORD PhyDrive)
 	DWORD dwBytes;
 	HANDLE hDrive;
 	CHAR PhyPath[MAX_PATH];
+	WCHAR PhyPathW[MAX_PATH];
 	STARTUPINFOA Si;
 	PROCESS_INFORMATION Pi;
 	GET_LENGTH_INFORMATION LengthInfo;
@@ -528,7 +626,16 @@ int VentoyMountISOByImdisk(const char *IsoPath, DWORD PhyDrive)
 	Log("VentoyMountISOByImdisk %s", IsoPath);
 
 	sprintf_s(PhyPath, sizeof(PhyPath), "\\\\.\\PhysicalDrive%d", PhyDrive);
-	hDrive = CreateFileA(PhyPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING, 0, 0);
+    if (IsUTF8Encode(PhyPath))
+    {
+        Utf8ToUtf16(PhyPath, PhyPathW);
+        hDrive = CreateFileW(PhyPathW, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING, 0, 0);
+    }
+    else
+    {
+        hDrive = CreateFileA(PhyPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING, 0, 0);
+    }
+    
 	if (hDrive == INVALID_HANDLE_VALUE)
 	{
 		Log("Could not open the disk<%s>, error:%u", PhyPath, GetLastError());
@@ -543,7 +650,7 @@ int VentoyMountISOByImdisk(const char *IsoPath, DWORD PhyDrive)
 	}
 
 	g_FatPhyDrive = hDrive;
-	g_Part2StartSec = (LengthInfo.Length.QuadPart - VENTOY_EFI_PART_SIZE) / 512;
+	g_Part2StartSec = GetVentoyEfiPartStartSector(hDrive);
 
 	Log("Parse FAT fs...");
 
@@ -704,6 +811,150 @@ static int DeleteVentoyPart2MountPoint(DWORD PhyDrive)
     return 1;
 }
 
+static BOOL check_tar_archive(const char *archive, CHAR *tarName)
+{
+    int len;
+    int nameLen;
+    const char *pos = archive;
+    const char *slash = archive;
+
+    while (*pos)
+    {
+        if (*pos == '\\' || *pos == '/')
+        {
+            slash = pos;
+        }
+        pos++;
+    }
+
+    len = (int)strlen(slash);
+
+    if (len > 7 && (strncmp(slash + len - 7, ".tar.gz", 7) == 0 || strncmp(slash + len - 7, ".tar.xz", 7) == 0))
+    {
+        nameLen = (int)sprintf_s(tarName, MAX_PATH, "X:%s", slash);
+        tarName[nameLen - 3] = 0;
+        return TRUE;
+    }
+    else if (len > 8 && strncmp(slash + len - 8, ".tar.bz2", 8) == 0)
+    {
+        nameLen = (int)sprintf_s(tarName, MAX_PATH, "X:%s", slash);
+        tarName[nameLen - 4] = 0;
+        return TRUE;
+    }
+    else if (len > 9 && strncmp(slash + len - 9, ".tar.lzma", 9) == 0)
+    {
+        nameLen = (int)sprintf_s(tarName, MAX_PATH, "X:%s", slash);
+        tarName[nameLen - 5] = 0;
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static int DecompressInjectionArchive(const char *archive, DWORD PhyDrive)
+{
+    int rc = 1;
+    BOOL bRet;
+    DWORD dwBytes;
+    HANDLE hDrive;
+    HANDLE hOut;
+    DWORD flags = CREATE_NO_WINDOW;
+    CHAR StrBuf[MAX_PATH];
+    CHAR tarName[MAX_PATH];
+    STARTUPINFOA Si;
+    PROCESS_INFORMATION Pi;
+    PROCESS_INFORMATION NewPi;
+    GET_LENGTH_INFORMATION LengthInfo;
+    SECURITY_ATTRIBUTES Sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
+
+    Log("DecompressInjectionArchive %s", archive);
+
+    sprintf_s(StrBuf, sizeof(StrBuf), "\\\\.\\PhysicalDrive%d", PhyDrive);
+    hDrive = CreateFileA(StrBuf, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING, 0, 0);
+    if (hDrive == INVALID_HANDLE_VALUE)
+    {
+        Log("Could not open the disk<%s>, error:%u", StrBuf, GetLastError());
+        goto End;
+    }
+
+    bRet = DeviceIoControl(hDrive, IOCTL_DISK_GET_LENGTH_INFO, NULL, 0, &LengthInfo, sizeof(LengthInfo), &dwBytes, NULL);
+    if (!bRet)
+    {
+        Log("Could not get phy disk %s size, error:%u", StrBuf, GetLastError());
+        goto End;
+    }
+
+    g_FatPhyDrive = hDrive;
+	g_Part2StartSec = GetVentoyEfiPartStartSector(hDrive);
+
+    Log("Parse FAT fs...");
+
+    fl_init();
+
+    if (0 == fl_attach_media(VentoyFatDiskRead, NULL))
+    {
+        if (g_64bit_system)
+        {
+            CopyFileFromFatDisk("/ventoy/7z/64/7za.exe", "ventoy\\7za.exe");
+        }
+        else
+        {
+            CopyFileFromFatDisk("/ventoy/7z/32/7za.exe", "ventoy\\7za.exe");
+        }
+
+        sprintf_s(StrBuf, sizeof(StrBuf), "ventoy\\7za.exe x -y -aoa -oX:\\ %s", archive);
+
+        Log("extract inject to X:");
+        Log("cmdline:<%s>", StrBuf);
+
+        GetStartupInfoA(&Si);
+
+        hOut = CreateFileA("ventoy\\7z.log",
+            FILE_APPEND_DATA,
+            FILE_SHARE_WRITE | FILE_SHARE_READ,
+            &Sa,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL);
+
+        Si.dwFlags |= STARTF_USESTDHANDLES;
+
+        if (hOut != INVALID_HANDLE_VALUE)
+        {
+            Si.hStdError = hOut;
+            Si.hStdOutput = hOut;
+        }
+
+        CreateProcessA(NULL, StrBuf, NULL, NULL, TRUE, flags, NULL, NULL, &Si, &Pi);
+        WaitForSingleObject(Pi.hProcess, INFINITE);
+
+        //
+        // decompress tar archive, for tar.gz/tar.xz/tar.bz2
+        //
+        if (check_tar_archive(archive, tarName))
+        {
+            Log("Decompress tar archive...<%s>", tarName);
+
+            sprintf_s(StrBuf, sizeof(StrBuf), "ventoy\\7za.exe x -y -aoa -oX:\\ %s", tarName);
+
+            CreateProcessA(NULL, StrBuf, NULL, NULL, TRUE, flags, NULL, NULL, &Si, &NewPi);
+            WaitForSingleObject(NewPi.hProcess, INFINITE);
+
+            Log("Now delete %s", tarName);
+            DeleteFileA(tarName);
+        }
+
+        SAFE_CLOSE_HANDLE(hOut);
+    }
+    fl_shutdown();
+
+End:
+
+    SAFE_CLOSE_HANDLE(hDrive);
+
+    return rc;
+}
+
 static int ProcessUnattendedInstallation(const char *script)
 {
     DWORD dw;
@@ -748,6 +999,11 @@ static int VentoyHook(ventoy_os_param *param)
 	CHAR IsoPath[MAX_PATH];
 
 	Log("Logical Drives=0x%x Path:<%s>", Drives, param->vtoy_img_path);
+
+    if (IsUTF8Encode(param->vtoy_img_path))
+    {
+        Log("This file is UTF8 encoding\n");
+    }
 
 	while (Drives)
 	{
@@ -809,6 +1065,24 @@ static int VentoyHook(ventoy_os_param *param)
         Log("auto install no need");
     }
 
+    if (g_windows_data.injection_archive[0])
+    {
+        sprintf_s(IsoPath, sizeof(IsoPath), "%C:%s", Letter, g_windows_data.injection_archive);
+        if (IsPathExist(FALSE, "%s", IsoPath))
+        {
+            Log("decompress injection archive %s...", IsoPath);
+            DecompressInjectionArchive(IsoPath, DiskExtent.DiskNumber);
+        }
+        else
+        {
+            Log("injection archive %s not exist", IsoPath);
+        }
+    }
+    else
+    {
+        Log("no injection archive found");
+    }
+
     return 0;
 }
 
@@ -829,6 +1103,64 @@ const char * GetFileNameInPath(const char *fullpath)
 	}
 	
 	return fullpath;
+}
+
+int VentoyJumpWimboot(INT argc, CHAR **argv, CHAR *LunchFile)
+{
+    int rc = 1;
+    char *buf = NULL;
+    DWORD size = 0;
+    DWORD Pos;
+
+#ifdef VTOY_32
+    g_64bit_system = FALSE;
+#else
+    g_64bit_system = TRUE;
+#endif
+    
+    Log("VentoyJumpWimboot %dbit", g_64bit_system ? 64 : 32);
+
+    sprintf_s(LunchFile, MAX_PATH, "X:\\setup.exe");
+
+    ReadWholeFile2Buf("wimboot.data", &buf, &size);
+    Log("wimboot.data size:%d", size);
+
+    memcpy(&g_os_param, buf, sizeof(ventoy_os_param));
+    memcpy(&g_windows_data, buf + sizeof(ventoy_os_param), sizeof(ventoy_windows_data));
+    memcpy(g_os_param_reserved, g_os_param.vtoy_reserved, sizeof(g_os_param_reserved));
+
+    if (g_os_param_reserved[0] == 1)
+    {
+        Log("break here for debug .....");
+        goto End;
+    }
+
+    // convert / to \\   
+    for (Pos = 0; Pos < sizeof(g_os_param.vtoy_img_path) && g_os_param.vtoy_img_path[Pos]; Pos++)
+    {
+        if (g_os_param.vtoy_img_path[Pos] == '/')
+        {
+            g_os_param.vtoy_img_path[Pos] = '\\';
+        }
+    }
+
+    if (g_os_param_reserved[0] == 2)
+    {
+        Log("skip hook for debug .....");
+        rc = 0;
+        goto End;
+    }
+
+    rc = VentoyHook(&g_os_param);
+
+End:
+
+    if (buf)
+    {
+        free(buf);
+    }
+
+    return rc;
 }
 
 int VentoyJump(INT argc, CHAR **argv, CHAR *LunchFile)
@@ -855,6 +1187,7 @@ int VentoyJump(INT argc, CHAR **argv, CHAR *LunchFile)
 	}
 	
 	g_64bit_system = IsPe64(Buffer);
+    Log("VentoyJump %dbit", g_64bit_system ? 64 : 32);
 
 	if (!IsPathExist(TRUE, "ventoy"))
 	{
@@ -967,7 +1300,15 @@ int main(int argc, char **argv)
     GetStartupInfoA(&Si);
 
     memset(LunchFile, 0, sizeof(LunchFile));
-    rc = VentoyJump(argc, argv, LunchFile);
+
+    if (strstr(argv[0], "vtoyjump.exe"))
+    {
+        rc = VentoyJumpWimboot(argc, argv, LunchFile);
+    }
+    else
+    {
+        rc = VentoyJump(argc, argv, LunchFile);
+    }
 
     if (g_os_param_reserved[0] == 3)
     {
@@ -976,11 +1317,17 @@ int main(int argc, char **argv)
     }
     else
     {
-        Si.dwFlags |= STARTF_USESHOWWINDOW;
-        Si.wShowWindow = SW_HIDE;
+        if (NULL == strstr(LunchFile, "setup.exe"))
+        {
+            Log("Not setup.exe, hide windows.");
+            Si.dwFlags |= STARTF_USESHOWWINDOW;
+            Si.wShowWindow = SW_HIDE;
+        }
+        
         Log("Ventoy jump %s ...", rc == 0 ? "success" : "failed");
     }
-
+    
+    Log("Now launch <%s> ...", LunchFile);
 	CreateProcessA(NULL, LunchFile, NULL, NULL, FALSE, 0, NULL, NULL, &Si, &Pi);
 
     while (rc)
